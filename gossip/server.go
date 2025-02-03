@@ -2,7 +2,7 @@ package main
 
 import (
 	"io"
-	"lab2/shared"
+	"lab3/shared"
 	"net/http"
 	"net/rpc"
 )

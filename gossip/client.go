@@ -2,12 +2,11 @@ package main
 
 import (
 	"fmt"
-	"lab2/shared"
+	"lab3/shared"
 	"math/rand"
 	"net/rpc"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -24,15 +23,34 @@ var self_node shared.Node
 // Send the current membership table to a neighboring node with the provided ID
 func sendMessage(server rpc.Client, id int, membership shared.Membership) {
 	//TODO
+	var success bool
+	request := shared.Request{ID: id, Table: membership} 
+	err := server.Call("Requests.Add", request, &success)
+	if err != nil {
+		shared.LogInfo(id, "Failed to send message to Node %d: %v", id, err)
+	} else {
+		shared.LogInfo(id, "Successfully sent message to Node %d.", id)
+	}
+	
 }
 
 // Read incoming messages from other nodes
 func readMessages(server rpc.Client, id int, membership shared.Membership) *shared.Membership {
 	//TODO
+	var received shared.Membership
+	err := server.Call("Requests.Listen", id, &received)
+	if err != nil {
+		shared.LogInfo(id, "No messages received.")
+		return nil		
+	}
+	shared.LogInfo(id, "Received updated membership table from Node %d.", id)
+	return &received
+	
 }
 
 func calcTime() float64 {
 	//TODO
+	return float64(time.Now().UnixNano()) / 1e9
 }
 
 var wg = &sync.WaitGroup{}
@@ -56,7 +74,7 @@ func main() {
 		fmt.Println("Found Error", err)
 	}
 
-	fmt.Println("Node", id, "will fail after", Z_TIME, "seconds")
+	shared.LogInfo(id, "Starting. Will fail after %d seconds.", Z_TIME)
 
 	currTime := calcTime()
 	// Construct self
@@ -90,15 +108,31 @@ func main() {
 
 func runAfterX(server *rpc.Client, node *shared.Node, membership **shared.Membership, id int) {
 	//TODO
+	node.Hbcounter++
+	node.Time = calcTime()
+	var response shared.Node
+	server.Call("Membership.Update", *node, &response)
+	shared.LogInfo(id, "Heartbeat incremented to %d. Updated node timestamp.", node.Hbcounter)
 }
 
 func runAfterY(server *rpc.Client, neighbors [2]int, membership **shared.Membership, id int) {
 	//TODO
+	for _, neighbor := range neighbors {
+		shared.LogInfo(id, "Sending membership table to neighbor Node %d.", neighbor)
+		sendMessage(*server, neighbor, **membership)
+	}	
 }
 
 func runAfterZ(server *rpc.Client, id int) {
 	//TODO
+	var node shared.Node
+	server.Call("Membership.Get", id, &node)
+	node.Alive = false
+	var response shared.Node
+	server.Call("Membership.Update", node, &response)
+	shared.LogInfo(id, "Node marked as FAILED.")
 }
+
 
 
 
