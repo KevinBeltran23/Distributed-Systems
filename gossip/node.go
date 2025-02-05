@@ -17,6 +17,7 @@ const (
 	MINARGS = 2
 	TIMEOUT = 10 * time.Second
 	INTERVAL = 2 * time.Second
+	TABLEINTERVAL = 5 * time.Second
 )
 
 type Node struct {
@@ -147,13 +148,87 @@ func (server *NodeServer) ReceiveHeartbeat(args Args, reply *bool) error {
 	return nil
 }
 
-//func updateNeighbors {/
-//
-//}
+func sendTable(server *NodeServer, peers []string) {
+	for {
+		time.Sleep(5 * time.Second) // Periodic table exchange interval
 
-//func receiveTable {
-//
-//}
+		if len(peers) == 0 {
+			continue
+		}
+
+		numPeers := len(peers)
+		numToSend := rand.Intn(numPeers) + 1 // Send to at least one peer
+
+		shuffledPeers := make([]string, len(peers))
+		copy(shuffledPeers, peers)
+		rand.Shuffle(len(shuffledPeers), func(i, j int) { shuffledPeers[i], shuffledPeers[j] = shuffledPeers[j], shuffledPeers[i] })
+
+		selectedPeers := shuffledPeers[:numToSend]
+
+		server.mu.Lock()
+		args := Args{ID: server.ID, TableList: server.Table}
+		server.mu.Unlock()
+
+		for _, peer := range selectedPeers {
+			peerAddress := "localhost:" + peer
+			client, err := rpc.Dial("tcp", peerAddress)
+			if err != nil {
+				log.Printf("Failed to connect to peer %s: %v", peerAddress, err)
+				continue
+			}
+
+			var reply bool
+			done := make(chan *rpc.Call, 1)
+			client.Go("NodeServer.ReceiveTable", args, &reply, done)
+
+			go func() {
+				select {
+				case res := <-done:
+					if res.Error != nil {
+						log.Println("Table exchange RPC failed:", res.Error)
+					} else {
+						log.Printf("Successfully sent table to Node %s", peer)
+					}
+				case <-time.After(TIMEOUT):
+					log.Println("Table exchange RPC timed out")
+				}
+				client.Close()
+			}()
+		}
+	}
+}
+
+
+func (server *NodeServer) ReceiveTable(args Args, reply *bool) error {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+
+	log.Printf("Received table from Node %d", args.ID)
+
+	for _, incomingNode := range args.TableList {
+		exists := false
+		for i, existingNode := range server.Table {
+			if existingNode.ID == incomingNode.ID {
+				// Prioritize updates based on heartbeat count
+				if incomingNode.HBcount > existingNode.HBcount ||
+					(incomingNode.HBcount == existingNode.HBcount && incomingNode.Timestamp.After(existingNode.Timestamp)) {
+					server.Table[i] = incomingNode
+				}
+				exists = true
+				break
+			}
+		}
+
+		// If the node is not in the table, add it
+		if !exists {
+			server.Table = append(server.Table, incomingNode)
+		}
+	}
+
+	*reply = true
+	return nil
+}
+
 
 // Detects failed nodes based on timeout
 func detectFailures(server *NodeServer) {
@@ -206,6 +281,7 @@ func main(){
 
 	go createServer(port, server)
 	go sendHeartbeat(server, peers)
+	go sendTable(server, peers)
 	//go detectFailures(server)
 	for {
 		time.Sleep(INTERVAL) 
