@@ -33,10 +33,11 @@ type Args struct {
     TableList []Node
 }
 
-type NodeServer int64
-
-var hbChannel = make(chan Args, BUFFER)
-
+type NodeServer struct{
+	mu sync.Mutex
+	ID int
+	Table []Node
+}
 
 // random ID from 1000-9000 using the current time as a seed
 func initID() int {
@@ -45,10 +46,11 @@ func initID() int {
     return nodeID
 }
 
-func createServer(port string){
-    // create a server for this node
-    server := new(NodeServer)
-    rpc.Register(server)
+func createServer(port string, server *NodeServer){
+    rError := rpc.RegisterName("NodeServer", server)
+    if rError != nil {
+        log.Fatal("ERROR in {Create Server} Failed to register: ", rError)
+    }
 
     listener, lError := net.Listen("tcp", ":" + port)
     if lError != nil {
@@ -66,76 +68,125 @@ func createServer(port string){
             continue
         }
 		log.Println("Successfully accepted on port: " + port)
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            rpc.ServeConn(connection)
+            connection.Close()
+        }()
     }
 }
 
-func detectFailures() {
-    for {
-        time.Sleep(5 * time.Second) // Failure detection interval
-        
-        now := time.Now()
-        for i, entry := range table {
-            if now.Sub(entry.Timestamp) > 10*time.Second { // Timeout threshold
-                log.Printf("Node %d marked as failed", entry.NodeID)
-                table[i].Status = 0 // Mark as failed
-            }
-        }
-    }
+// Sends heartbeat messages to a random peer
+func sendHeartbeat(server *NodeServer, peers []string) {
+	for {
+		time.Sleep(INTERVAL) // Heartbeat interval
+
+		if len(peers) == 0 {
+			continue
+		}
+
+		peerIndex := rand.Intn(len(peers))
+		peer := peers[peerIndex]
+
+		client, err := rpc.Dial("tcp", peer)
+		if err != nil {
+			log.Printf("Failed to connect to peer %s: %v", peer, err)
+			continue
+		}
+
+		server.mu.Lock()
+		args := Args{ID: server.ID, TableList: server.Table}
+		server.mu.Unlock()
+
+		var reply bool
+		done := make(chan *rpc.Call, 1) // Buffered channel to avoid goroutine leak
+		call := client.Go("NodeServer.ReceiveHeartbeat", args, &reply, done)
+
+		select {
+		case <-call.Done:
+			if call.Error != nil {
+				log.Println("RPC call failed:", call.Error)
+			}
+		case <-time.After(TIMEOUT):
+			log.Println("RPC call timed out")
+		}
+
+		client.Close()
+	}
 }
 
-// does the remote calling using rpc
-func sendHeartbeat(nodeID int, peers []string, table []MembershipTable) {
-    for {
-        time.Sleep(2 * time.Second) 
-        
-        peerIndex := rand.Intn(len(peers))
-        peer := peers[peerIndex]
+// Receives heartbeats and updates the membership table
+func (server *NodeServer) ReceiveHeartbeat(args Args, reply *bool) error {
+	server.mu.Lock()
+	defer server.mu.Unlock()
 
-        client, err := rpc.Dial("tcp", peer)
-        if err != nil {
-            log.Printf("Failed to connect to peer %s: %v", peer, err)
-            continue
-        }
+	log.Printf("Heartbeat received from Node %d", args.ID)
 
-        args := Args{NodeID: nodeID, HBTableList: table}
-        var reply bool
-        err = client.Call("NodeServer.ReceiveHeartbeat", args, &reply)
-        if err != nil {
-            log.Printf("RPC call failed: %v", err)
-        }
-        client.Close()
-    }
-}
+	// Update or add node in the table
+	exists := false
+	for i, entry := range server.Table {
+		if entry.ID == args.ID {
+			server.Table[i].HBcount++
+			server.Table[i].Timestamp = time.Now()
+			exists = true
+			break
+		}
+	}
 
-
-// remotely called 
-func (node *NodeServer) ReceiveHeartbeat(args *Args, reply *bool) error{
-	log.Printf("Heartbeat received from Node %d", args.NodeID)
-
-	hbChannel <- *args
-    // Update membership table
-    for i, entry := range table {
-        if entry.NodeID == args.NodeID {
-            table[i].HBcount++
-            table[i].Timestamp = time.Now()
-            return nil
-        }
-    }
-
-    // If the node is new, add it to the table
-    table = append(table, MembershipTable{
-        NodeID:    args.NodeID,
-        Status:    1, // Active
-        HBcount:   1,
-        Timestamp: time.Now(),
-    })
+	// add to membership table if not already in
+	if !exists {
+		server.Table = append(server.Table, Node{
+			ID:        args.ID,
+			Status:    1,
+			HBcount:   1,
+			Timestamp: time.Now(),
+		})
+	}
 
 	*reply = true
 	return nil
 }
 
-func updateMembershipTable(){
+//func updateNeighbors {/
+//
+//}
 
+//func receiveTable {
+//
+//}
+
+// Detects failed nodes based on timeout
+func detectFailures(server *NodeServer) {
+	for {
+		time.Sleep(5 * time.Second) // Failure detection interval
+
+		server.mu.Lock()
+		now := time.Now()
+		for i, entry := range server.Table {
+			if now.Sub(entry.Timestamp) > TIMEOUT {
+				log.Printf("Node %d marked as failed", entry.ID)
+				server.Table[i].Status = 0 // Mark as failed
+			}
+		}
+		server.mu.Unlock()
+	}
+}
+
+func logMembershipTable(server *NodeServer) {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+
+	fmt.Println("\n\nTable List for Node: " + strconv.Itoa(server.ID))
+	fmt.Println("-------------------------------------")
+	for _, value := range server.Table {
+		fmt.Printf("NodeID: %d\n", value.ID)
+		fmt.Printf("Status: %d\n", value.Status)
+		fmt.Printf("HBCount: %d\n", value.HBcount)
+		fmt.Println("Timestamp: " + value.Timestamp.Format("15:04:05"))
+		fmt.Println()
+	}
+	fmt.Println("-------------------------------------\n")
 }
 
 func main(){
@@ -146,21 +197,21 @@ func main(){
 	port := os.Args[1]
 	peers := os.Args[2:]
 
-	go createServer(port)
+	nodeID = initID()
+	server := &NodeServer{
+		ID: nodeID,
+		Table: []Node{
+			{ID: nodeID, Status: 1, HBcount: 0, Timestamp: time.Now()},
+		},
+	}
 
-    var membershipTable []Node = []Node{}
-    mu := sync.Mutex{}
-
-    // Create and initialize the current node in the membership table
-	nodeID := initID()
-    membershipTable = append(membershipTable, Node{
-        ID:   nodeID,
-        Status:   0,
-        HBcount:  0,
-        Timestamp: time.Now(),
-    })
-
-    go detectFailures()
-	go sendHeartbeat(nodeID, peers, membershipTable)
+	go createServer(port, server)
+	go sendHeartbeat(server, peers)
+	//go detectFailures(server)
+	for {
+		time.Sleep(INTERVAL) 
+		logMembershipTable(server)
+	}
+	select {}
 
 }
