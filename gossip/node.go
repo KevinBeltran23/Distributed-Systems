@@ -201,13 +201,15 @@ func sendTable(server *NodeServer, peers []string) {
 	}
 }
 
-                             
+
 func (server *NodeServer) ReceiveTable(args Args, reply *bool) error {
 	server.mu.Lock()
 	defer server.mu.Unlock()
+	newTable := []Node{}
+	deadNode := false
 
 	log.Printf("Received table from Node %d", args.ID)
-
+	count := 0
 	for _, incomingNode := range args.TableList {
 		exists := false
 		for i, existingNode := range server.Table {
@@ -215,19 +217,35 @@ func (server *NodeServer) ReceiveTable(args Args, reply *bool) error {
 				// Prioritize updates based on heartbeat count
 				if incomingNode.HBcount > existingNode.HBcount ||
 					(incomingNode.HBcount == existingNode.HBcount && incomingNode.Timestamp.After(existingNode.Timestamp)) {
-					server.Table[i] = incomingNode
+					server.Table[i].Timestamp = incomingNode.Timestamp
+					server.Table[i].HBcount = incomingNode.HBcount
 				}
 				exists = true
 				break
 			}
 		}
-
+		
+		if incomingNode.Status == 0{
+			deadNode = true
+		}
+		count += 1
 		// If the node is not in the table, add it
-		if !exists {
+		// Check for status code 0 to prevent bad nodes from being added back
+		if (!exists && incomingNode.Status != 0){
 			server.Table = append(server.Table, incomingNode)
 		}
 	}
-
+	
+	if deadNode == true{
+		//remove the zeroed out Node(s) from the table
+		for _, entry := range server.Table{
+			if entry.Status == 1{
+				newTable = append(newTable, entry)
+			}
+		}
+		//update server table once loop is done
+		server.Table = newTable
+	}
 	*reply = true
 	return nil
 }
@@ -235,34 +253,33 @@ func (server *NodeServer) ReceiveTable(args Args, reply *bool) error {
 
 // Detects failed nodes based on timeout
 func detectFailures(server *NodeServer) {
-	for {
-		time.Sleep(FAILTIME) 
+    for {
+        time.Sleep(FAILTIME) 
 
-		server.mu.Lock()
-		now := time.Now()
-		newTable := []Node{}
+        server.mu.Lock()
+        now := time.Now()
+        newTable := []Node{}
 
-		for _, entry := range server.Table {
-			elapsed := now.Sub(entry.Timestamp)
+        for _, entry := range server.Table {
+            elapsed := now.Sub(entry.Timestamp)
 
-			if elapsed > DEATHTIME {
-				log.Printf("Node %d removed from table due to inactivity", entry.ID)
-				continue // Skip adding this node to the new table
-			}
+            if elapsed > DEATHTIME {
+                log.Printf("Node %d removed from table due to inactivity", entry.ID)
+                continue // Skip adding this node to the new table
+            }
 
-			if elapsed > FAILTIME {
-				log.Printf("Node %d marked as failed", entry.ID)
-				entry.Status = 0 
-			}
+            if elapsed > FAILTIME {
+                log.Printf("Node %d marked as failed", entry.ID)
+                entry.Status = 0 
+            }
 
-			newTable = append(newTable, entry)
-		}
+            newTable = append(newTable, entry)
+        }
 
-		server.Table = newTable // Update the table with only active nodes
-		server.mu.Unlock()
-	}
+        server.Table = newTable // Update the table with only active nodes
+        server.mu.Unlock()
+    }
 }
-
 
 func logMembershipTable(server *NodeServer) {
 	server.mu.Lock()
