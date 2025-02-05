@@ -16,8 +16,9 @@ const (
 	BUFFER = 100
 	MINARGS = 2
 	TIMEOUT = 10 * time.Second
-	INTERVAL = 2 * time.Second
-	TABLEINTERVAL = 5 * time.Second
+	HBINTERVAL = 2 * time.Second
+	TABLEINTERVAL = 7 * time.Second
+	FAILTIME = 30 * time.Second
 )
 
 type Node struct {
@@ -79,7 +80,7 @@ func createServer(port string, server *NodeServer){
 // Sends heartbeat messages to a random peer
 func sendHeartbeat(server *NodeServer, peers []string) {
 	for {
-		time.Sleep(INTERVAL) // Heartbeat interval
+		time.Sleep(HBINTERVAL) // Heartbeat interval
 
 		if len(peers) == 0 {
 			continue
@@ -129,6 +130,7 @@ func (server *NodeServer) ReceiveHeartbeat(args Args, reply *bool) error {
 		if entry.ID == args.ID {
 			server.Table[i].HBcount++
 			server.Table[i].Timestamp = time.Now()
+			server.Table[i].Status = 1
 			exists = true
 			break
 		}
@@ -150,14 +152,14 @@ func (server *NodeServer) ReceiveHeartbeat(args Args, reply *bool) error {
 
 func sendTable(server *NodeServer, peers []string) {
 	for {
-		time.Sleep(5 * time.Second) // Periodic table exchange interval
+		time.Sleep(TABLEINTERVAL) // Periodic table exchange interval
 
 		if len(peers) == 0 {
 			continue
 		}
 
 		numPeers := len(peers)
-		numToSend := rand.Intn(numPeers) + 1 // Send to at least one peer
+		numToSend := rand.Intn(numPeers) + 1 
 
 		shuffledPeers := make([]string, len(peers))
 		copy(shuffledPeers, peers)
@@ -233,14 +235,14 @@ func (server *NodeServer) ReceiveTable(args Args, reply *bool) error {
 // Detects failed nodes based on timeout
 func detectFailures(server *NodeServer) {
 	for {
-		time.Sleep(5 * time.Second) // Failure detection interval
+		time.Sleep(FAILTIME) // Failure detection interval
 
 		server.mu.Lock()
 		now := time.Now()
 		for i, entry := range server.Table {
-			if now.Sub(entry.Timestamp) > TIMEOUT {
+			if now.Sub(entry.Timestamp) > FAILTIME {
 				log.Printf("Node %d marked as failed", entry.ID)
-				server.Table[i].Status = 0 // Mark as failed
+				server.Table[i].Status = 0 
 			}
 		}
 		server.mu.Unlock()
@@ -270,8 +272,17 @@ func main(){
 
 	port := os.Args[1]
 	peers := os.Args[2:]
+	
+	nodeID, err := strconv.Atoi(port)
+	if err != nil {
+		log.Fatalf("Invalid port number %s: %v", port, err)
+	}
 
-	nodeID := initID()
+	if (os.Args[len(os.Args) - 1] == "bad"){
+        //don't include last arg
+        peers = os.Args[2:(len(os.Args) - 2)]
+    }
+
 	server := &NodeServer{
 		ID: nodeID,
 		Table: []Node{
@@ -282,11 +293,21 @@ func main(){
 	go createServer(port, server)
 	go sendHeartbeat(server, peers)
 	go sendTable(server, peers)
-	//go detectFailures(server)
-	for {
-		time.Sleep(INTERVAL) 
-		logMembershipTable(server)
-	}
-	select {}
+	go detectFailures(server)
 
+	num_loops := 0
+	rand.Seed(time.Now().UnixNano()) 
+	FAILURE := rand.Intn(16) + 5
+
+    for {
+        time.Sleep(HBINTERVAL) 
+        logMembershipTable(server)
+        num_loops += 1
+        if ((os.Args[len(os.Args) - 1] == "bad") && (num_loops > FAILURE)){
+            fmt.Println("Node failing!")
+            return
+        }
+    }
+
+	select {}
 }
