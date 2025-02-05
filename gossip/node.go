@@ -6,12 +6,10 @@ import (
 	"math/rand"
 	"net"
 	"net/rpc"
-	"net/http"
 	"os"
 	"strconv"
 	"sync"
 	"time"
-	"io"
 )
 
 const (
@@ -88,8 +86,9 @@ func sendHeartbeat(server *NodeServer, peers []string) {
 
 		peerIndex := rand.Intn(len(peers))
 		peer := peers[peerIndex]
+		peerAddress := "localhost:" + peers[peerIndex] // Ensure correct address format
 
-		client, err := rpc.Dial("tcp", peer)
+		client, err := rpc.Dial("tcp", peerAddress)
 		if err != nil {
 			log.Printf("Failed to connect to peer %s: %v", peer, err)
 			continue
@@ -197,7 +196,7 @@ func main(){
 	port := os.Args[1]
 	peers := os.Args[2:]
 
-	nodeID = initID()
+	nodeID := initID()
 	server := &NodeServer{
 		ID: nodeID,
 		Table: []Node{
