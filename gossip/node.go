@@ -19,6 +19,7 @@ const (
 	HBINTERVAL = 2 * time.Second
 	TABLEINTERVAL = 7 * time.Second
 	FAILTIME = 30 * time.Second
+	DEATHTIME = 2 * FAILTIME
 )
 
 type Node struct {
@@ -200,7 +201,7 @@ func sendTable(server *NodeServer, peers []string) {
 	}
 }
 
-
+                             
 func (server *NodeServer) ReceiveTable(args Args, reply *bool) error {
 	server.mu.Lock()
 	defer server.mu.Unlock()
@@ -235,19 +236,33 @@ func (server *NodeServer) ReceiveTable(args Args, reply *bool) error {
 // Detects failed nodes based on timeout
 func detectFailures(server *NodeServer) {
 	for {
-		time.Sleep(FAILTIME) // Failure detection interval
+		time.Sleep(FAILTIME) 
 
 		server.mu.Lock()
 		now := time.Now()
-		for i, entry := range server.Table {
-			if now.Sub(entry.Timestamp) > FAILTIME {
-				log.Printf("Node %d marked as failed", entry.ID)
-				server.Table[i].Status = 0 
+		newTable := []Node{}
+
+		for _, entry := range server.Table {
+			elapsed := now.Sub(entry.Timestamp)
+
+			if elapsed > DEATHTIME {
+				log.Printf("Node %d removed from table due to inactivity", entry.ID)
+				continue // Skip adding this node to the new table
 			}
+
+			if elapsed > FAILTIME {
+				log.Printf("Node %d marked as failed", entry.ID)
+				entry.Status = 0 
+			}
+
+			newTable = append(newTable, entry)
 		}
+
+		server.Table = newTable // Update the table with only active nodes
 		server.mu.Unlock()
 	}
 }
+
 
 func logMembershipTable(server *NodeServer) {
 	server.mu.Lock()
