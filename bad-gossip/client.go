@@ -44,6 +44,7 @@ func readMessages(server rpc.Client, id int, membership shared.Membership) *shar
 		return nil		
 	}
 	shared.LogInfo(id, "Received updated membership table from Node %d.", id)
+	shared.LogMembershipTable(id, &membership)
 	return &received
 	
 }

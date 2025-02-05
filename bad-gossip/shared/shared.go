@@ -51,6 +51,20 @@ func LogInfo(nodeID int, format string, a ...interface{}) {
 	log.Printf("[Node %d] %s - %s", nodeID, time.Now().Format("15:04:05.000"), msg)
 }
 
+// Log membership table to the console.
+func LogMembershipTable(id int, m *Membership) {
+	fmt.Printf("Node %d Membership Table:\n", id)
+	for _, node := range m.Members {
+		status := "is Alive"
+		if !node.Alive {
+			status = "is Dead"
+		}
+		fmt.Printf("Node %d: hb=%d, time=%.2f, status=%s\n", node.ID, node.Hbcounter, node.Time, status)
+	}
+	fmt.Println("")
+}
+
+
 /*---------------*/
 
 
