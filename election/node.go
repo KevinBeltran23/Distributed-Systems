@@ -32,12 +32,18 @@ const (
 	LEADER_HB_INTERVAL = 50 * time.Millisecond
 )
 
+// Separate gossip membership state from Raft state
 type Node struct {
-    ID            int
-    Status        int
+    // Gossip membership fields
+    ID        int
+    Status    int
+    HBcount   int64
+    Timestamp time.Time
+}
+
+// Keep Raft state separate and local to each node
+type RaftState struct {
     Role          int       // FOLLOWER, CANDIDATE, or LEADER
-    HBcount       int64
-    Timestamp     time.Time
     Term          int       // Current term
     VotedFor      int      // ID of voted-for candidate
     CurrentLeader int      // Current leader's ID
@@ -50,12 +56,13 @@ type Args struct {
 
 type NodeServer struct {
 	mu              sync.Mutex
-	self            *Node        // Pointer to this server's own Node entry
-	Table           []Node
-	HBChannel       chan Args           // Regular gossip heartbeats
-	LeaderHBChannel chan LeaderHeartbeat // Leader heartbeats for Raft
-	VoteChannel     chan VoteRequest    // Incoming vote requests
-	VoteResponses   chan VoteResponse   // Responses to vote requests
+	nodeID          int
+	raftState       *RaftState    // Local Raft state
+	Table           []Node        // Membership table
+	HBChannel       chan Args     // Regular gossip heartbeats
+	LeaderHBChannel chan LeaderHeartbeat
+	VoteChannel     chan VoteRequest
+	VoteResponses   chan VoteResponse
 }
 
 type LeaderHeartbeat struct {
@@ -132,7 +139,7 @@ func sendHeartbeat(server *NodeServer, peers []string) {
 		}
 
 		server.mu.Lock()
-		args := Args{ID: server.self.ID, TableList: server.Table}
+		args := Args{ID: server.nodeID, TableList: server.Table}
 		server.mu.Unlock()
 
 		var reply bool
@@ -211,7 +218,7 @@ func sendTable(server *NodeServer, peers []string) {
 		selectedPeers := shuffledPeers[:numToSend]
 
 		server.mu.Lock()
-		args := Args{ID: server.self.ID, TableList: server.Table}
+		args := Args{ID: server.nodeID, TableList: server.Table}
 		server.mu.Unlock()
 
 		for _, peer := range selectedPeers {
@@ -243,54 +250,49 @@ func sendTable(server *NodeServer, peers []string) {
 	}
 }
 
-//TODO
-// I need to make this go on a channel just in case 
+// Update ReceiveTable to only handle membership info
 func (server *NodeServer) ReceiveTable(args Args, reply *bool) error {
-	server.mu.Lock()
-	defer server.mu.Unlock()
-	newTable := []Node{}
-	deadNode := false
+    server.mu.Lock()
+    defer server.mu.Unlock()
+    newTable := []Node{}
+    deadNode := false
 
-	log.Printf("Received table from Node %d", args.ID)
-	count := 0
-	for _, incomingNode := range args.TableList {
-		exists := false
-		for i, existingNode := range server.Table {
-			if existingNode.ID == incomingNode.ID {
-				// Prioritize updates based on heartbeat count
-				if incomingNode.HBcount > existingNode.HBcount ||
-					(incomingNode.HBcount == existingNode.HBcount && incomingNode.Timestamp.After(existingNode.Timestamp)) {
-					server.Table[i].Timestamp = incomingNode.Timestamp
-					server.Table[i].HBcount = incomingNode.HBcount
-				}
-				exists = true
-				break
-			}
-		}
-		
-		if incomingNode.Status == 0{
-			deadNode = true
-		}
-		count += 1
-		// If the node is not in the table, add it
-		// Check for status code 0 to prevent bad nodes from being added back
-		if (!exists && incomingNode.Status != 0){
-			server.Table = append(server.Table, incomingNode)
-		}
-	}
-	
-	if deadNode == true{
-		//remove the zeroed out Node(s) from the table
-		for _, entry := range server.Table{
-			if entry.Status == 1{
-				newTable = append(newTable, entry)
-			}
-		}
-		//update server table once loop is done
-		server.Table = newTable
-	}
-	*reply = true
-	return nil
+    log.Printf("Received table from Node %d", args.ID)
+    for _, incomingNode := range args.TableList {
+        exists := false
+        for i, existingNode := range server.Table {
+            if existingNode.ID == incomingNode.ID {
+                // Only update membership-related fields
+                if incomingNode.HBcount > existingNode.HBcount ||
+                    (incomingNode.HBcount == existingNode.HBcount && incomingNode.Timestamp.After(existingNode.Timestamp)) {
+                    server.Table[i].Timestamp = incomingNode.Timestamp
+                    server.Table[i].HBcount = incomingNode.HBcount
+                    server.Table[i].Status = incomingNode.Status
+                }
+                exists = true
+                break
+            }
+        }
+        
+        if incomingNode.Status == 0 {
+            deadNode = true
+        }
+        
+        if (!exists && incomingNode.Status != 0) {
+            server.Table = append(server.Table, incomingNode)
+        }
+    }
+    
+    if deadNode {
+        for _, entry := range server.Table {
+            if entry.Status == 1 {
+                newTable = append(newTable, entry)
+            }
+        }
+        server.Table = newTable
+    }
+    *reply = true
+    return nil
 }
 
 
@@ -330,12 +332,12 @@ func (server *NodeServer) logRaft(format string, args ...interface{}) {
         FOLLOWER:  "FOLLOWER",
         CANDIDATE: "CANDIDATE",
         LEADER:    "LEADER",
-    }[server.self.Role]
+    }[server.raftState.Role]
     
     prefix := fmt.Sprintf("[Node %d][%s][Term %d] ", 
-        server.self.ID, 
+        server.nodeID, 
         roleStr, 
-        server.self.Term)
+        server.raftState.Term)
     log.Printf(prefix+format, args...)
 }
 
@@ -348,13 +350,13 @@ func logMembershipTable(server *NodeServer) {
         FOLLOWER:  "FOLLOWER",
         CANDIDATE: "CANDIDATE",
         LEADER:    "LEADER",
-    }[server.self.Role]
+    }[server.raftState.Role]
 
-    fmt.Printf("\n=== Node %d Status ===\n", server.self.ID)
+    fmt.Printf("\n=== Node %d Status ===\n", server.nodeID)
     fmt.Printf("Role: %s\n", roleStr)
-    fmt.Printf("Term: %d\n", server.self.Term)
-    if server.self.CurrentLeader != -1 {
-        fmt.Printf("Current Leader: %d\n", server.self.CurrentLeader)
+    fmt.Printf("Term: %d\n", server.raftState.Term)
+    if server.raftState.CurrentLeader != -1 {
+        fmt.Printf("Current Leader: %d\n", server.raftState.CurrentLeader)
     } else {
         fmt.Printf("No leader elected\n")
     }
@@ -369,34 +371,28 @@ func logMembershipTable(server *NodeServer) {
     fmt.Println("=====================\n")
 }
 
-// start elections if leader does not communicate
 func startElectionTimeout(server *NodeServer) {
     for {
-        // Random timeout between 150-300ms
         timeout := time.Duration(rand.Intn(150)+150) * time.Millisecond
         timer := time.NewTimer(timeout)
 
         select {
         case leaderHB := <-server.LeaderHBChannel:
             server.mu.Lock()
-            if server.self.Role != LEADER && leaderHB.Term >= server.self.Term {
-                server.self.Term = leaderHB.Term
-                server.self.Role = FOLLOWER
-                server.self.CurrentLeader = leaderHB.LeaderID
-                server.self.VotedFor = -1
+            if server.raftState.Role != LEADER && leaderHB.Term >= server.raftState.Term {
+                server.raftState.Term = leaderHB.Term
+                server.raftState.Role = FOLLOWER
+                server.raftState.CurrentLeader = leaderHB.LeaderID
+                server.raftState.VotedFor = -1
+                timer.Reset(timeout)
             }
             server.mu.Unlock()
-            timer.Reset(timeout)
 
         case <-timer.C:
             server.mu.Lock()
-            // Only followers should start elections
-            if server.self.Role == FOLLOWER {
-                server.logRaft("Starting election for term %d", server.self.Term+1)
-                server.self.Term++
-                server.self.Role = CANDIDATE
-                server.self.VotedFor = server.self.ID
-                server.self.CurrentLeader = -1
+            // Only start election if we're a follower AND we don't have a current leader
+            if server.raftState.Role == FOLLOWER && server.raftState.CurrentLeader == -1 {
+                server.logRaft("Starting election for term %d", server.raftState.Term+1)
                 go server.startElection()
             }
             server.mu.Unlock()
@@ -404,54 +400,55 @@ func startElectionTimeout(server *NodeServer) {
     }
 }
 
+
 func (server *NodeServer) startElection() {
     server.mu.Lock()
-    currentTerm := server.self.Term
-    server.logRaft("Starting election for term %d", currentTerm+1)
-    server.self.Term++
-    server.self.Role = CANDIDATE
-    server.self.VotedFor = server.self.ID
-    server.self.CurrentLeader = -1
+    server.raftState.Term++
+    server.raftState.Role = CANDIDATE
+    server.raftState.VotedFor = server.nodeID
+    server.raftState.CurrentLeader = -1
+    currentTerm := server.raftState.Term
+    
+    // Count total nodes including self
+    //totalNodes := len(server.Table)
+    //votesNeeded := (totalNodes / 2) + 1
+	votesNeeded := 3
+    server.logRaft("starting election for term %d", currentTerm)
     server.mu.Unlock()
 
     votes := 1 // Vote for self
-    votesNeeded := (len(server.Table) + 1) / 2 + 1
     
-    // Create channels for vote collection
-    voteResponses := make(chan VoteResponse, len(server.Table))
-    timeout := time.After(VOTE_WAIT_TIMEOUT)
-
     // Request votes from all nodes
     for _, node := range server.Table {
-        go func(peer int) {
-            client, err := rpc.Dial("tcp", fmt.Sprintf("localhost:%d", peer))
+        go func(peerID int) {
+            client, err := rpc.Dial("tcp", fmt.Sprintf("localhost:%d", peerID))
             if err != nil {
                 return
             }
             defer client.Close()
 
             request := VoteRequest{
-                CandidateID: server.self.ID,
+                CandidateID: server.nodeID,
                 Term:       currentTerm,
             }
             
             var response VoteResponse
             if err := client.Call("NodeServer.RequestVote", request, &response); err == nil {
-                voteResponses <- response
+                server.VoteResponses <- response
             }
         }(node.ID)
     }
 
-    // Collect votes
+    // Collect votes with timeout
+    timeout := time.After(VOTE_WAIT_TIMEOUT)
     for {
         select {
-        case response := <-voteResponses:
+        case response := <-server.VoteResponses:
             server.mu.Lock()
-            // If we've seen a higher term, step down
-            if response.Term > server.self.Term {
-                server.self.Term = response.Term
-                server.self.Role = FOLLOWER
-                server.self.VotedFor = -1
+            if response.Term > server.raftState.Term {
+                server.raftState.Term = response.Term
+                server.raftState.Role = FOLLOWER
+                server.raftState.VotedFor = -1
                 server.mu.Unlock()
                 return
             }
@@ -459,11 +456,10 @@ func (server *NodeServer) startElection() {
             if response.VoteGranted {
                 votes++
                 if votes >= votesNeeded {
-                    if server.self.Role == CANDIDATE {
-                        log.Printf("Node %d: Won election for term %d with %d votes", 
-                            server.self.ID, server.self.Term, votes)
-                        server.self.Role = LEADER
-                        server.self.CurrentLeader = server.self.ID
+                    if server.raftState.Role == CANDIDATE {
+                        server.logRaft("Won election with %d votes", votes)
+                        server.raftState.Role = LEADER
+                        server.raftState.CurrentLeader = server.nodeID
                         go server.startLeaderHeartbeat()
                     }
                     server.mu.Unlock()
@@ -474,79 +470,93 @@ func (server *NodeServer) startElection() {
 
         case <-timeout:
             server.mu.Lock()
-            if server.self.Role == CANDIDATE {
+            if server.raftState.Role == CANDIDATE {
                 server.logRaft("Election timed out - reverting to follower")
-                server.self.Role = FOLLOWER
+                server.raftState.Role = FOLLOWER
             }
             server.mu.Unlock()
             return
-        case <-server.LeaderHBChannel:
-            server.logRaft("Received leader heartbeat during election - stepping down")
         }
     }
 }
 
-// respond to vote requests from candidates
 func (server *NodeServer) RequestVote(request *VoteRequest, response *VoteResponse) error {
     server.mu.Lock()
     defer server.mu.Unlock()
 
-    response.Term = server.self.Term
-    response.VoterID = server.self.ID
+    response.Term = server.raftState.Term
+    response.VoterID = server.nodeID
     response.VoteGranted = false
 
-    if request.Term < server.self.Term {
+    // If we're the leader or we already have a leader, reject vote requests from same term
+    if (server.raftState.Role == LEADER || server.raftState.CurrentLeader != -1) && 
+       request.Term <= server.raftState.Term {
         return nil
     }
 
-    if request.Term > server.self.Term {
-        server.self.Term = request.Term
-        server.self.Role = FOLLOWER
-        server.self.VotedFor = -1
+    if request.Term < server.raftState.Term {
+        return nil
     }
 
-    // Grant vote if we haven't voted in this term or already voted for this candidate
-    if (server.self.VotedFor == -1 || server.self.VotedFor == request.CandidateID) && 
-        request.Term >= server.self.Term {
+    if request.Term > server.raftState.Term {
+        server.raftState.Term = request.Term
+        server.raftState.Role = FOLLOWER
+        server.raftState.VotedFor = -1
+        server.raftState.CurrentLeader = -1  // Clear leader since we're moving to new term
+    }
+
+    if (server.raftState.VotedFor == -1 || server.raftState.VotedFor == request.CandidateID) && 
+        request.Term >= server.raftState.Term {
         response.VoteGranted = true
-        server.self.VotedFor = request.CandidateID
-        server.self.Term = request.Term
+        server.raftState.VotedFor = request.CandidateID
+        server.raftState.Term = request.Term
     }
 
     return nil
 }
 
-// send the leader heartbeats to all other nodes
 func (server *NodeServer) startLeaderHeartbeat() {
-    ticker := time.NewTicker(LEADER_HB_INTERVAL)
-    defer ticker.Stop()
-
-    for range ticker.C {
+    server.logRaft("Starting leader heartbeat broadcasts")
+    
+    for {
+        time.Sleep(LEADER_HB_INTERVAL)
+        
         server.mu.Lock()
-        if server.self.Role != LEADER {
+        if server.raftState.Role != LEADER {
+            server.logRaft("No longer leader - stopping heartbeat broadcasts")
             server.mu.Unlock()
             return
         }
-        currentTerm := server.self.Term
+        
+        // Capture current state while holding lock
+        currentTerm := server.raftState.Term
+        leaderID := server.nodeID
+        peers := make([]int, 0)
+        for _, node := range server.Table {
+            if node.ID != server.nodeID {
+                peers = append(peers, node.ID)
+            }
+        }
         server.mu.Unlock()
 
-        // Send heartbeat to all nodes
-        for _, node := range server.Table {
-            go func(nodeID int) {
-                client, err := rpc.Dial("tcp", fmt.Sprintf("localhost:%d", nodeID))
+        // Send heartbeats to all peers
+        for _, peerID := range peers {
+            go func(targetID int) {
+                addr := fmt.Sprintf("localhost:%d", targetID)
+                client, err := rpc.Dial("tcp", addr)
                 if err != nil {
                     return
                 }
                 defer client.Close()
-
+                
                 heartbeat := LeaderHeartbeat{
                     Term:     currentTerm,
-                    LeaderID: server.self.ID,
+                    LeaderID: leaderID,
                 }
                 
                 var reply bool
                 client.Call("NodeServer.ReceiveLeaderHeartbeat", heartbeat, &reply)
-            }(node.ID)
+            }(peerID)
         }
     }
 }
@@ -556,34 +566,38 @@ func (server *NodeServer) ReceiveLeaderHeartbeat(heartbeat LeaderHeartbeat, repl
     server.mu.Lock()
     defer server.mu.Unlock()
 
-    // If we're the leader, ignore heartbeats
-    if server.self.Role == LEADER {
+    // If we're the leader and our term is current or higher, ignore heartbeats
+    if server.raftState.Role == LEADER && heartbeat.Term <= server.raftState.Term {
         *reply = true
         return nil
     }
 
-    if heartbeat.Term < server.self.Term {
+    if heartbeat.Term < server.raftState.Term {
         *reply = false
         return nil
     }
 
-    if heartbeat.Term > server.self.Term {
-        server.self.Term = heartbeat.Term
-        server.self.Role = FOLLOWER
-        server.self.VotedFor = -1
+    // Update term and become follower if we see a higher term
+    if heartbeat.Term > server.raftState.Term {
+        server.raftState.Term = heartbeat.Term
+        server.raftState.Role = FOLLOWER
+        server.raftState.VotedFor = -1
     }
 
-    server.self.CurrentLeader = heartbeat.LeaderID
+    // Always update leader when we accept a heartbeat
+    server.raftState.CurrentLeader = heartbeat.LeaderID
     *reply = true
 
     // Forward to the heartbeat channel for election timeout reset
     select {
     case server.LeaderHBChannel <- heartbeat:
     default:
+        // Channel full, skip (timeout will eventually trigger if this becomes a problem)
     }
 
     return nil
 }
+
 
 func main(){
 	if len(os.Args) < MINARGS {
@@ -604,7 +618,8 @@ func main(){
     }
 
 	server := &NodeServer{
-		self: &Node{ID: nodeID, Status: 1, HBcount: 0, Timestamp: time.Now()},
+		nodeID: nodeID,
+		raftState: &RaftState{Role: FOLLOWER, Term: 0, VotedFor: -1, CurrentLeader: -1},
 		Table: []Node{
 			{ID: nodeID, Status: 1, HBcount: 0, Timestamp: time.Now()},
 		},
