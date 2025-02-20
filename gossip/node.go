@@ -38,6 +38,7 @@ type NodeServer struct{
 	mu sync.Mutex
 	ID int
 	Table []Node
+	HBChannel chan Args
 }
 
 // random ID from 1000-9000 using the current time as a seed
@@ -118,38 +119,46 @@ func sendHeartbeat(server *NodeServer, peers []string) {
 	}
 }
 
-// Receives heartbeats and updates the membership table
+// Receives heartbeats and enqueues them on to the channel for processing
 func (server *NodeServer) ReceiveHeartbeat(args Args, reply *bool) error {
-	server.mu.Lock()
-	defer server.mu.Unlock()
-
-	log.Printf("Heartbeat received from Node %d", args.ID)
-
-	// Update or add node in the table
-	exists := false
-	for i, entry := range server.Table {
-		if entry.ID == args.ID {
-			server.Table[i].HBcount++
-			server.Table[i].Timestamp = time.Now()
-			server.Table[i].Status = 1
-			exists = true
-			break
-		}
-	}
-
-	// add to membership table if not already in
-	if !exists {
-		server.Table = append(server.Table, Node{
-			ID:        args.ID,
-			Status:    1,
-			HBcount:   1,
-			Timestamp: time.Now(),
-		})
-	}
-
-	*reply = true
-	return nil
+    select {
+    case server.HBChannel <- args: 
+        *reply = true
+    default:
+        log.Println("Heartbeat dropped due to full buffer")
+        *reply = false
+    }
+    return nil
 }
+
+// updates the table with received heartbeats
+func processHeartbeats(server *NodeServer) {
+    for args := range server.HBChannel {
+        server.mu.Lock()
+
+        exists := false
+        for i, entry := range server.Table {
+            if entry.ID == args.ID {
+                server.Table[i].HBcount++
+                server.Table[i].Timestamp = time.Now()
+                server.Table[i].Status = 1
+                exists = true
+                break
+            }
+        }
+        
+        if !exists {
+            server.Table = append(server.Table, Node{
+                ID:        args.ID,
+                Status:    1,
+                HBcount:   1,
+                Timestamp: time.Now(),
+            })
+        }
+        server.mu.Unlock()
+    }
+}
+
 
 func sendTable(server *NodeServer, peers []string) {
 	for {
@@ -200,7 +209,6 @@ func sendTable(server *NodeServer, peers []string) {
 		}
 	}
 }
-
 
 func (server *NodeServer) ReceiveTable(args Args, reply *bool) error {
 	server.mu.Lock()
@@ -320,12 +328,14 @@ func main(){
 		Table: []Node{
 			{ID: nodeID, Status: 1, HBcount: 0, Timestamp: time.Now()},
 		},
+		HBChannel: make(chan Args, BUFFER),
 	}
 
 	go createServer(port, server)
 	go sendHeartbeat(server, peers)
 	go sendTable(server, peers)
 	go detectFailures(server)
+	go processHeartbeats(server) 
 
 	num_loops := 0
 	rand.Seed(time.Now().UnixNano()) 

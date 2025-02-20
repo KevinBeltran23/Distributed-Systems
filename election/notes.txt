@@ -1,0 +1,14 @@
+
+This is for personal reference.
+
+I plan on making a utils file and a main file
+
+In the main file I want a set of core functions
+
+- create the server for the node
+- update the nodes table
+- send a messaage
+- receive a message
+- activity functions after x time
+    nodes die, or just do other stuff
+- 
