@@ -373,25 +373,32 @@ func logMembershipTable(server *NodeServer) {
 
 func startElectionTimeout(server *NodeServer) {
     for {
-        timeout := time.Duration(rand.Intn(150)+150) * time.Millisecond
+        timeout := time.Duration(rand.Intn(5000)+5000) * time.Millisecond
         timer := time.NewTimer(timeout)
 
         select {
         case leaderHB := <-server.LeaderHBChannel:
+			//if !timer.Stop() {
+			//	<-timer.C
+			//}
+			timer.Reset(timeout)
             server.mu.Lock()
             if server.raftState.Role != LEADER && leaderHB.Term >= server.raftState.Term {
                 server.raftState.Term = leaderHB.Term
                 server.raftState.Role = FOLLOWER
                 server.raftState.CurrentLeader = leaderHB.LeaderID
                 server.raftState.VotedFor = -1
+                // Properly stop the old timer before resetting
+                if !timer.Stop() {
+                    <-timer.C
+                }
                 timer.Reset(timeout)
             }
             server.mu.Unlock()
 
         case <-timer.C:
             server.mu.Lock()
-            // Only start election if we're a follower AND we don't have a current leader
-            if server.raftState.Role == FOLLOWER && server.raftState.CurrentLeader == -1 {
+            if server.raftState.Role == FOLLOWER {
                 server.logRaft("Starting election for term %d", server.raftState.Term+1)
                 go server.startElection()
             }
@@ -488,9 +495,7 @@ func (server *NodeServer) RequestVote(request *VoteRequest, response *VoteRespon
     response.VoterID = server.nodeID
     response.VoteGranted = false
 
-    // If we're the leader or we already have a leader, reject vote requests from same term
-    if (server.raftState.Role == LEADER || server.raftState.CurrentLeader != -1) && 
-       request.Term <= server.raftState.Term {
+    if server.raftState.Role == LEADER && request.Term <= server.raftState.Term {
         return nil
     }
 
@@ -518,6 +523,15 @@ func (server *NodeServer) RequestVote(request *VoteRequest, response *VoteRespon
 func (server *NodeServer) startLeaderHeartbeat() {
     server.logRaft("Starting leader heartbeat broadcasts")
     
+    // Create a map to store persistent connections
+    peerConns := make(map[int]*rpc.Client)
+    defer func() {
+        // Clean up connections when done
+        for _, conn := range peerConns {
+            conn.Close()
+        }
+    }()
+    
     for {
         time.Sleep(LEADER_HB_INTERVAL)
         
@@ -539,23 +553,31 @@ func (server *NodeServer) startLeaderHeartbeat() {
         }
         server.mu.Unlock()
 
-        // Send heartbeats to all peers
+        // Send heartbeats to all peers without waiting for responses
         for _, peerID := range peers {
             go func(targetID int) {
-                addr := fmt.Sprintf("localhost:%d", targetID)
-                client, err := rpc.Dial("tcp", addr)
-                if err != nil {
-                    return
+                // Try to get existing connection
+                client, exists := peerConns[targetID]
+                if !exists {
+                    // Create new connection if needed
+                    var err error
+                    addr := fmt.Sprintf("localhost:%d", targetID)
+                    client, err = rpc.Dial("tcp", addr)
+                    if err != nil {
+                        server.logRaft("Failed to connect to peer %d: %v", targetID, err)
+                        return
+                    }
+                    peerConns[targetID] = client
                 }
-                defer client.Close()
                 
                 heartbeat := LeaderHeartbeat{
                     Term:     currentTerm,
                     LeaderID: leaderID,
                 }
                 
+                // Fire-and-forget heartbeat
                 var reply bool
-                client.Call("NodeServer.ReceiveLeaderHeartbeat", heartbeat, &reply)
+                client.Go("NodeServer.ReceiveLeaderHeartbeat", heartbeat, &reply, nil)
             }(peerID)
         }
     }
@@ -582,15 +604,16 @@ func (server *NodeServer) ReceiveLeaderHeartbeat(heartbeat LeaderHeartbeat, repl
         server.raftState.Term = heartbeat.Term
         server.raftState.Role = FOLLOWER
         server.raftState.VotedFor = -1
+		log.Println("We saw a higher term so we updated")
     }
 
     // Always update leader when we accept a heartbeat
     server.raftState.CurrentLeader = heartbeat.LeaderID
     *reply = true
-
     // Forward to the heartbeat channel for election timeout reset
     select {
     case server.LeaderHBChannel <- heartbeat:
+		log.Println("Forwarded to the heartbeat channel")
     default:
         // Channel full, skip (timeout will eventually trigger if this becomes a problem)
     }
