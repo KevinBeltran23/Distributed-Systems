@@ -20,6 +20,8 @@ const (
 	TABLEINTERVAL = 7 * time.Second
 	FAILTIME = 30 * time.Second
 	DEATHTIME = 2 * FAILTIME
+
+    NUMPORTS = 8
 	
 	// Raft-specific constants
 	FOLLOWER  = 0
@@ -378,9 +380,6 @@ func startElectionTimeout(server *NodeServer) {
 
         select {
         case leaderHB := <-server.LeaderHBChannel:
-			//if !timer.Stop() {
-			//	<-timer.C
-			//}
 			timer.Reset(timeout)
             server.mu.Lock()
             if server.raftState.Role != LEADER && leaderHB.Term >= server.raftState.Term {
@@ -416,10 +415,7 @@ func (server *NodeServer) startElection() {
     server.raftState.CurrentLeader = -1
     currentTerm := server.raftState.Term
     
-    // Count total nodes including self
-    //totalNodes := len(server.Table)
-    //votesNeeded := (totalNodes / 2) + 1
-	votesNeeded := 3
+	votesNeeded := (NUMPORTS / 2) + 1
     server.logRaft("starting election for term %d", currentTerm)
     server.mu.Unlock()
 
