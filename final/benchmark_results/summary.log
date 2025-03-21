@@ -1,0 +1,9 @@
+=== Performance Summary ===
+Implementation,Nodes,Time(s)
+Sequential,1,0.052072
+Row-Based,1,
+Row-Based,2,
+Row-Based,4,
+Tile-Based,1,
+Tile-Based,2,
+Tile-Based,4,

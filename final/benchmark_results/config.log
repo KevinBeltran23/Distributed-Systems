@@ -1,0 +1,5 @@
+=== Benchmark Configuration ===
+Matrix Size: 1000x1000
+Kernel Size: 5x5
+Iterations: 10
+
